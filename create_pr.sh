@@ -7,8 +7,18 @@
 #
 #   <clone先フォルダ>  : リポジトリを clone済みのフォルダ
 #   <ブランチ名>       : PR の作成元(source)ブランチ
-#   <環境>             : Terraform/envs 配下の環境フォルダ (j1, j2, j3, st, pr)
+#   <環境>             : 各スタックの env 配下の環境フォルダ (j1, j2, j3, st, pr)
 #   [マージ先ブランチ] : PR のマージ先(destination)ブランチ (省略時: main)
+#
+# ディレクトリ構成 (ブランチ直下):
+#   terraform/
+#     stacks/
+#       01-workload/env/<環境>/   <- terraform plan のルートディレクトリ
+#       02-apprelease/env/<環境>/ <- terraform plan のルートディレクトリ
+#       03-dbrelease/env/<環境>/  <- terraform plan のルートディレクトリ
+#
+#   上記 3 スタックそれぞれで terraform plan を実行し、結果をスタックごとに
+#   PR のコメントとして投稿する。
 #
 # オプション:
 #   -n, --dry-run      : terraform plan は実行するが、PR の作成・コメント投稿は
@@ -70,25 +80,55 @@ REPO_DIR="$(pwd)"
 REPO_NAME="$(basename "$(git config --get remote.origin.url)")"
 log_info "リポジトリ: $REPO_NAME"
 
-# ---- Terraform plan の実行 -------------------------------------------------
-# 環境フォルダ(j1/j2/j3/st/pr)はフルパスで指定する
-PLAN_DIR="$REPO_DIR/Terraform/envs/$ENV"
-log_info "Terraform plan を実行します: $PLAN_DIR"
+# ---- terraform plan を実行するスタック一覧 ---------------------------------
+# ブランチ直下の terraform/stacks 配下にある各スタックの env/<環境> が
+# terraform plan のルートディレクトリ。
+STACKS=(
+  "01-workload"
+  "02-apprelease"
+  "03-dbrelease"
+)
+STACKS_BASE="$REPO_DIR/terraform/stacks"
 
-PLAN_OUTPUT="$(
-  cd "$PLAN_DIR"
-  terraform init -input=false -no-color >/dev/null
-  terraform plan -input=false -no-color 2>&1
-)"
-
-# ---- Terraform plan の結果をコメント用に整形 -------------------------------
+# ---- 各スタックで Terraform plan を実行 ------------------------------------
 # CodeCommit のコメントは最大 10240 文字。マークダウンの装飾分を差し引いた
 # 上限を超える場合は plan 結果の末尾を切り詰める。
 MAX_LEN=10000
-if [ "${#PLAN_OUTPUT}" -gt "$MAX_LEN" ]; then
-  PLAN_OUTPUT="$(printf '%s' "$PLAN_OUTPUT" | head -c "$MAX_LEN")
+
+# スタック名と整形済み plan 結果を対応付けて保持する(同一 index)。
+STACK_NAMES=()
+STACK_OUTPUTS=()
+
+for STACK in "${STACKS[@]}"; do
+  PLAN_DIR="$STACKS_BASE/$STACK/env/$ENV"
+
+  if [ ! -d "$PLAN_DIR" ]; then
+    log_warn "[$STACK] plan 対象のディレクトリが存在しないためスキップします: $PLAN_DIR"
+    continue
+  fi
+
+  log_info "Terraform plan を実行します: $PLAN_DIR"
+
+  PLAN_OUTPUT="$(
+    cd "$PLAN_DIR"
+    terraform init -input=false -no-color >/dev/null
+    terraform plan -input=false -no-color 2>&1
+  )"
+
+  if [ "${#PLAN_OUTPUT}" -gt "$MAX_LEN" ]; then
+    PLAN_OUTPUT="$(printf '%s' "$PLAN_OUTPUT" | head -c "$MAX_LEN")
 ... (以降は文字数上限のため省略しました)"
-  log_warn "plan 結果が長いため末尾を切り詰めました。"
+    log_warn "[$STACK] plan 結果が長いため末尾を切り詰めました。"
+  fi
+
+  STACK_NAMES+=("$STACK")
+  STACK_OUTPUTS+=("$PLAN_OUTPUT")
+done
+
+# ---- plan 対象が 1 つも無い場合はエラー ------------------------------------
+# 全スタックでディレクトリが存在せずスキップされた場合は処理を中断する。
+if [ "${#STACK_NAMES[@]}" -eq 0 ]; then
+  die "plan 対象のディレクトリが 1 つも見つかりませんでした (環境: $ENV)"
 fi
 
 # ---- dry-run の場合はここで終了 --------------------------------------------
@@ -97,8 +137,10 @@ PR_TITLE="[$ENV] $SOURCE_BRANCH -> $DEST_BRANCH"
 if [ "$DRY_RUN" = "true" ]; then
   log_warn "dry-run モードのため、PR の作成とコメント投稿はスキップします。"
   log_info "作成される予定の PR: $PR_TITLE (repo: $REPO_NAME)"
-  log_info "----- 投稿される予定の plan 結果 -----"
-  printf '%s\n' "$PLAN_OUTPUT" >&2
+  for i in "${!STACK_NAMES[@]}"; do
+    log_info "----- 投稿される予定の plan 結果 (${STACK_NAMES[$i]}) -----"
+    printf '%s\n' "${STACK_OUTPUTS[$i]}" >&2
+  done
   exit 0
 fi
 
@@ -117,18 +159,23 @@ DEST_COMMIT="$(echo "$PR_JSON"  | grep -o '"destinationCommit": *"[^"]*"'| head 
 [ -n "$PR_ID" ] || die "プルリクエストの作成に失敗しました。"
 log_info "プルリクエスト作成完了: PR ID = $PR_ID"
 
-# ---- Terraform plan の結果をコメントとして投稿 -----------------------------
-COMMENT="### Terraform plan 結果 ($ENV)
+# ---- Terraform plan の結果をスタックごとにコメントとして投稿 ---------------
+for i in "${!STACK_NAMES[@]}"; do
+  STACK="${STACK_NAMES[$i]}"
+  PLAN_OUTPUT="${STACK_OUTPUTS[$i]}"
+
+  COMMENT="### Terraform plan 結果 ($ENV / $STACK)
 \`\`\`
 $PLAN_OUTPUT
 \`\`\`"
 
-aws codecommit post-comment-for-pull-request \
-  --pull-request-id "$PR_ID" \
-  --repository-name "$REPO_NAME" \
-  --before-commit-id "$DEST_COMMIT" \
-  --after-commit-id "$SOURCE_COMMIT" \
-  --content "$COMMENT" \
-  --output text >/dev/null
+  aws codecommit post-comment-for-pull-request \
+    --pull-request-id "$PR_ID" \
+    --repository-name "$REPO_NAME" \
+    --before-commit-id "$DEST_COMMIT" \
+    --after-commit-id "$SOURCE_COMMIT" \
+    --content "$COMMENT" \
+    --output text >/dev/null
 
-log_info "Terraform plan の結果をコメントとして投稿しました。"
+  log_info "[$STACK] Terraform plan の結果をコメントとして投稿しました。"
+done
