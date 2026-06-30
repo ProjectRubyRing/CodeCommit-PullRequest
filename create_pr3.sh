@@ -29,10 +29,20 @@
 #   -n, --dry-run      : tfplan の読み込み(terraform show)は行うが、PR の作成・
 #                        コメント投稿は行わない(副作用のある操作をスキップして内容を確認する)
 #
+#   --auto-assume-role        : CodeCommit 権限が無い場合に終了せず、別チーム提供の
+#                               シェルを source して自動でスイッチロールする
+#                               (既定: 警告して終了)
+#   --assume-role-script <p>  : 自動スイッチロール時に source するシェルのパス
+#                               (環境変数 ASSUME_ROLE_SCRIPT でも指定可)
+#
+# 事前条件:
+#   - 事前に `aws login --remote` で認証しておくこと(未認証なら警告して終了する)。
+#
 # 例:
 #   ./create_pr.sh ./my-repo feature/foo j1
 #   ./create_pr.sh ./my-repo feature/foo pr develop
 #   ./create_pr.sh --dry-run ./my-repo feature/foo j1
+#   ./create_pr.sh --auto-assume-role --assume-role-script /opt/team/assume_role.sh ./my-repo feature/foo j1
 #
 set -euo pipefail
 
@@ -48,16 +58,25 @@ require_cmd terraform "Terraform をインストールしてください"
 
 # ---- オプション解析 --------------------------------------------------------
 DRY_RUN=false
+AUTO_ASSUME_ROLE=false
+ASSUME_ROLE_SCRIPT_OPT=""
 POSITIONAL=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -n|--dry-run) DRY_RUN=true; shift ;;
+    -n|--dry-run)           DRY_RUN=true; shift ;;
+    --auto-assume-role)     AUTO_ASSUME_ROLE=true; shift ;;
+    --assume-role-script)   ASSUME_ROLE_SCRIPT_OPT="${2:?--assume-role-script にはパスを指定してください}"; shift 2 ;;
+    --assume-role-script=*) ASSUME_ROLE_SCRIPT_OPT="${1#*=}"; shift ;;
     --)           shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
     -*)           die "不明なオプション: $1" ;;
     *)            POSITIONAL+=("$1"); shift ;;
   esac
 done
 set -- "${POSITIONAL[@]}"
+
+# ---- 事前認証(aws login --remote)の確認 ------------------------------------
+# 未認証なら警告して終了する。
+require_aws_auth
 
 # ---- 引数チェック ----------------------------------------------------------
 if [ "$#" -lt 3 ]; then
@@ -84,6 +103,11 @@ REPO_DIR="$(pwd)"
 # CodeCommit の remote URL 末尾がリポジトリ名
 REPO_NAME="$(basename "$(git config --get remote.origin.url)")"
 log_info "リポジトリ: $REPO_NAME"
+
+# ---- CodeCommit への操作権限の確認 -----------------------------------------
+# 権限が無い場合、既定では警告して終了する。--auto-assume-role 指定時は
+# 別チーム提供のシェルを source して自動でスイッチロールする。
+require_codecommit_access "$REPO_NAME" "$AUTO_ASSUME_ROLE" "$ASSUME_ROLE_SCRIPT_OPT"
 
 # ---- 対象スタック一覧 ------------------------------------------------------
 # ブランチ直下の terraform/stacks 配下にある各スタックの env/<環境> に、
